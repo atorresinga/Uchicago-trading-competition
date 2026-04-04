@@ -18,7 +18,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from submisioncursor import PublicMeta, create_strategy, load_meta, load_prices, ASSET_COLUMNS
+from submission import PublicMeta, create_strategy, load_meta, load_prices, ASSET_COLUMNS
 
 # ---------------------------------------------------------------------------
 # Constants (must match the competition runtime)
@@ -217,7 +217,7 @@ def _run_cv(prices: np.ndarray, meta: PublicMeta, strategy):
     sharpes = []
     for k, train_end, test_end in folds:
         # create_strategy() each fold so fit() starts fresh
-        from submisioncursor import create_strategy as _cs
+        from submission import create_strategy as _cs
         strat = _cs()
         result = run_backtest(prices[:train_end], prices[train_end:test_end], strat, meta)
         label = f"Train years 0-{k-1}, test year {k}"
