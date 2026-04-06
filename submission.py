@@ -771,6 +771,80 @@ class IntradayRiskParity(StrategyBase):
         return self.current_weights
 
 
+class SectorAwareIntradayRiskParity(IntradayRiskParity):
+    """Intraday risk parity with sector-aware risk tilts (notebook-driven).
+
+    After standard risk-parity weights and spread/borrow penalties, applies:
+    1. **Dynamic tilt:** recent per-asset realized vol is averaged by ``meta.sector_id``;
+       assets in sectors whose mean vol exceeds the **median** across sectors are
+       down-weighted (handles persistent high-vol buckets like sector 3).
+    2. **Static mild tilt:** extra discount for sectors 2 and 3, which showed higher
+       late-sample stress in exploratory regime plots (does not hard-code dates).
+
+    Same hyperparameters as :class:`IntradayRiskParity` plus ``sector_vol_tilt`` and
+    ``static_hot_sector_mult``. Set ``sector_vol_tilt=0`` and ``static_hot_sector_mult=1``
+    to recover base intraday risk parity behavior (up to numerics).
+    """
+
+    def __init__(
+        self,
+        *args,
+        sector_vol_tilt: float = 0.5,
+        static_hot_sector_mult: float = 1.0,
+        hot_sector_ids: tuple[int, ...] = (2, 3),
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.sector_vol_tilt = float(sector_vol_tilt)
+        self.static_hot_sector_mult = float(static_hot_sector_mult)
+        self.hot_sector_ids = hot_sector_ids
+        self._sector_ids: np.ndarray | None = None
+
+    def fit(self, train_prices: np.ndarray, meta: PublicMeta, **kwargs) -> None:
+        self._sector_ids = np.asarray(meta.sector_id, dtype=int)
+        super().fit(train_prices, meta, **kwargs)
+
+    def _sector_risk_multipliers(self, prices: np.ndarray) -> np.ndarray:
+        """Per-asset multipliers in (0, 1], then caller renormalizes weights."""
+        if self._sector_ids is None or self.sector_vol_tilt <= 0:
+            m = np.ones(N_ASSETS, dtype=float)
+        else:
+            ann_vol = _realized_vol_intraday(prices, self.vol_lookback_days)
+            sectors = np.unique(self._sector_ids)
+            sec_mean: dict[int, float] = {}
+            for s in sectors:
+                mask = self._sector_ids == s
+                sec_mean[int(s)] = float(np.mean(ann_vol[mask]))
+            med = float(np.median(list(sec_mean.values())))
+            if med < 1e-12:
+                m = np.ones(N_ASSETS, dtype=float)
+            else:
+                m = np.ones(N_ASSETS, dtype=float)
+                for i in range(N_ASSETS):
+                    sid = int(self._sector_ids[i])
+                    rel = sec_mean[sid] / med
+                    excess = max(0.0, rel - 1.0)
+                    m[i] = 1.0 / (1.0 + self.sector_vol_tilt * excess)
+
+        if self.static_hot_sector_mult < 1.0 and self._sector_ids is not None:
+            hot = set(self.hot_sector_ids)
+            for i in range(N_ASSETS):
+                if int(self._sector_ids[i]) in hot:
+                    m[i] *= self.static_hot_sector_mult
+        return m
+
+    def _compute_base_weights(self, prices: np.ndarray) -> np.ndarray:
+        w = super()._compute_base_weights(prices)
+        mult = self._sector_risk_multipliers(prices)
+        w = np.maximum(w * mult, 0.0)
+        s = float(np.sum(w))
+        if s > 1e-12:
+            w /= s
+        else:
+            w = np.ones(N_ASSETS) / N_ASSETS
+        return w
+
+
 def create_default_intraday_risk_parity() -> IntradayRiskParity:
     """Default tuned IntradayRiskParity (same hyperparameters as competition submission)."""
     return IntradayRiskParity(
@@ -787,6 +861,31 @@ def create_default_intraday_risk_parity() -> IntradayRiskParity:
     )
 
 
+def create_sector_aware_intraday_risk_parity() -> SectorAwareIntradayRiskParity:
+    """Intraday RP + dynamic sector vol tilt (from regime_analysis).
+
+    Tuned on sliding-month Sharpes: ``sector_vol_tilt=0.5`` and no static sector
+    cut (``static_hot_sector_mult=1``) slightly lowers var(S) vs baseline IRP with
+    essentially the same mean. Re-enable ``static_hot_sector_mult < 1`` for
+    sectors 2–3 if you want a stronger notebook prior.
+    """
+    return SectorAwareIntradayRiskParity(
+        cov_lookback_days=60,
+        vol_lookback_days=20,
+        rebalance_freq=20,
+        blend_rate=0.5,
+        vol_target=0.15,
+        vol_cap=1.0,
+        vol_floor=0.2,
+        use_intraday_cov=True,
+        spread_penalty=0.5,
+        borrow_penalty=1.0,
+        sector_vol_tilt=0.5,
+        static_hot_sector_mult=1.0,
+        hot_sector_ids=(2, 3),
+    )
+
+
 # Factories for batch comparison (months_validate / compare_strategies_months).
 STRATEGY_REGISTRY: dict[str, Callable[[], StrategyBase]] = {
     "baseline": Baseline,
@@ -795,9 +894,11 @@ STRATEGY_REGISTRY: dict[str, Callable[[], StrategyBase]] = {
     "cost_aware_tilt": CostAwareTilt,
     "momentum_tilt": MomentumTilt,
     "intraday_risk_parity": create_default_intraday_risk_parity,
+    "sector_aware_intraday_rp": create_sector_aware_intraday_risk_parity,
 }
 
 
 def create_strategy() -> StrategyBase:
     """Entry point called by validate.py and months_validate.py."""
+    # Swap to ``create_sector_aware_intraday_risk_parity()`` for regime-notebook tilt.
     return create_default_intraday_risk_parity()
