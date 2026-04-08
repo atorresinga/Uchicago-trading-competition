@@ -1,8 +1,8 @@
 """
 analyze_round.py — Post-round analysis for Case 1 bot.
 
-Reads the most recent logs/round_*.jsonl file (or one you pass on the
-command line) and produces a single HTML report with charts and stats.
+Reads the most recent logs/round_*.jsonl file and produces a single 
+HTML report with charts, including MtM PnL, Cash, and Exposure.
 
 Usage:
     python analyze_round.py                       # latest round
@@ -24,7 +24,7 @@ from io import BytesIO
 
 
 # ---------------------------------------------------------------------------
-# Load
+# Load & Process
 # ---------------------------------------------------------------------------
 
 def load_log(path: Path) -> list[dict]:
@@ -48,6 +48,53 @@ def latest_log() -> Path:
     return logs[-1]
 
 
+def enrich_with_cash_and_pnl(events: list[dict]) -> list[dict]:
+    """Reconstruct cash flow from fills and swaps to calculate MtM PnL."""
+    cash = 0.0
+    prev_pos = {}
+    
+    for e in events:
+        if e["kind"] == "fill":
+            pos = e.get("positions") or {}
+            sym = "?"
+            diff_qty = 0
+            for k, v in pos.items():
+                if prev_pos.get(k, 0) != v:
+                    sym = k
+                    diff_qty = v - prev_pos.get(k, 0)
+                    break
+            
+            # diff_qty > 0 means we bought (cash decreases)
+            # diff_qty < 0 means we sold (cash increases)
+            if sym != "?":
+                cash -= diff_qty * e.get("price", 0)
+            prev_pos = pos
+
+        elif e["kind"] == "swap":
+            # ETF creation/redemption costs 5 cash per swap
+            if e.get("success"):
+                cash -= 5.0
+                
+        elif e["kind"] == "snapshot":
+            e["calc_cash"] = cash
+            mids = e.get("mids") or {}
+            pos = e.get("positions") or {}
+            
+            # MtM = Cash + Value of all holdings at current mid price
+            mtm = cash
+            gross_exposure = 0.0
+            for k, v in pos.items():
+                if k in mids and mids[k] is not None:
+                    position_value = v * mids[k]
+                    mtm += position_value
+                    gross_exposure += abs(position_value)
+                    
+            e["calc_mtm"] = mtm
+            e["calc_gross_exposure"] = gross_exposure
+            
+    return events
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -58,7 +105,6 @@ def fig_to_base64(fig) -> str:
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
 
-
 def to_relative_seconds(ts_series: pd.Series) -> pd.Series:
     return ts_series - ts_series.min()
 
@@ -66,6 +112,80 @@ def to_relative_seconds(ts_series: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
+
+def chart_pnl(snapshots: pd.DataFrame) -> str:
+    if snapshots.empty or "calc_mtm" not in snapshots.columns:
+        return ""
+    fig, ax = plt.subplots(figsize=(10, 4))
+    
+    ax.plot(snapshots["t_rel"], snapshots["calc_cash"], label="Cash Balance", color="#27ae60", linestyle="--", linewidth=1.5, alpha=0.7)
+    ax.plot(snapshots["t_rel"], snapshots["calc_mtm"], label="Mark-to-Market PnL", color="#2980b9", linewidth=2.5)
+    
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Seconds since round start")
+    ax.set_ylabel("Value ($)")
+    ax.set_title("Cash vs. True PnL (Mark-to-Market)")
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.3)
+    return fig_to_base64(fig)
+
+
+def chart_exposure(snapshots: pd.DataFrame) -> str:
+    if snapshots.empty or "calc_gross_exposure" not in snapshots.columns:
+        return ""
+    fig, ax = plt.subplots(figsize=(10, 3))
+    
+    ax.fill_between(snapshots["t_rel"], 0, snapshots["calc_gross_exposure"], color="#e74c3c", alpha=0.3)
+    ax.plot(snapshots["t_rel"], snapshots["calc_gross_exposure"], color="#c0392b", linewidth=1.5, label="Gross Capital Exposure")
+    
+    ax.set_xlabel("Seconds since round start")
+    ax.set_ylabel("Absolute Market Value ($)")
+    ax.set_title("Gross Inventory Exposure (Risk)")
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.3)
+    return fig_to_base64(fig)
+
+
+def chart_fv_and_rates(snapshots: pd.DataFrame) -> str:
+    if snapshots.empty:
+        return ""
+    
+    # Extract FV and A mid
+    rows = []
+    for _, r in snapshots.iterrows():
+        mids = r.get("mids") or {}
+        rows.append({
+            "t": r["t_rel"], 
+            "mid_A": mids.get("A", None),
+            "fv_A": r.get("fv_A", None),
+            "rate_exp": r.get("rate_exp_bps", 0)
+        })
+        
+    df = pd.DataFrame(rows).dropna(subset=["mid_A", "fv_A"])
+    if df.empty:
+        return ""
+
+    fig, ax1 = plt.subplots(figsize=(10, 4))
+    
+    # Plot Asset A vs FV
+    ax1.plot(df["t"], df["mid_A"], label="Asset A Mid", color="#8e44ad", linewidth=1.5)
+    ax1.plot(df["t"], df["fv_A"], label="FV Model A", color="#f39c12", linestyle="--", linewidth=1.5)
+    ax1.set_xlabel("Seconds since round start")
+    ax1.set_ylabel("Price of A", color="#8e44ad")
+    ax1.tick_params(axis="y", labelcolor="#8e44ad")
+    ax1.legend(loc="upper left")
+    
+    # Plot Rates on secondary axis
+    ax2 = ax1.twinx()
+    ax2.plot(df["t"], df["rate_exp"], label="Rate Expectation (bps)", color="#34495e", linewidth=1.0, alpha=0.5)
+    ax2.set_ylabel("Rate Exp. (bps)", color="#34495e")
+    ax2.tick_params(axis="y", labelcolor="#34495e")
+    ax2.legend(loc="upper right")
+    
+    plt.title("Asset A Tracking vs. Macro Rate Signals")
+    ax1.grid(alpha=0.3)
+    return fig_to_base64(fig)
+
 
 def chart_positions(snapshots: pd.DataFrame) -> str:
     if snapshots.empty:
@@ -82,9 +202,14 @@ def chart_positions(snapshots: pd.DataFrame) -> str:
     for sym, sub in df.groupby("sym"):
         ax.plot(sub["t"], sub["qty"], label=sym, linewidth=1.4)
     ax.axhline(0, color="black", linewidth=0.5)
+    
+    # Add gentle visual bounds for risk limits (assuming +/- 200)
+    ax.axhline(200, color="red", linestyle=":", alpha=0.5)
+    ax.axhline(-200, color="red", linestyle=":", alpha=0.5)
+    
     ax.set_xlabel("Seconds since round start")
     ax.set_ylabel("Position (signed units)")
-    ax.set_title("Positions over time")
+    ax.set_title("Positions over time (Dotted red = Typical Risk Limit)")
     ax.legend(loc="upper left", fontsize=8, ncol=2)
     ax.grid(alpha=0.3)
     return fig_to_base64(fig)
@@ -116,7 +241,7 @@ def chart_mids(snapshots: pd.DataFrame, fills: pd.DataFrame) -> str:
                 ax.scatter(f["t_rel"], f["price"], s=18, alpha=0.7, label=f"{sym} fills")
     ax.set_xlabel("Seconds since round start")
     ax.set_ylabel("Mid price")
-    ax.set_title("Mid prices with fills overlaid")
+    ax.set_title("Main Assets: Mid prices with fills overlaid")
     ax.legend(loc="best", fontsize=8, ncol=2)
     ax.grid(alpha=0.3)
     return fig_to_base64(fig)
@@ -134,20 +259,6 @@ def chart_rejects(rejects: pd.DataFrame) -> str:
     return fig_to_base64(fig)
 
 
-def chart_fill_rate(snapshots: pd.DataFrame, fills: pd.DataFrame) -> str:
-    if snapshots.empty:
-        return ""
-    fig, ax = plt.subplots(figsize=(10, 3))
-    if not fills.empty:
-        fills_per_sec = fills.groupby(fills["t_rel"].astype(int)).size()
-        ax.bar(fills_per_sec.index, fills_per_sec.values, color="#2980b9", width=0.9)
-    ax.set_xlabel("Seconds since round start")
-    ax.set_ylabel("Fills / second")
-    ax.set_title("Fill activity over time")
-    ax.grid(alpha=0.3)
-    return fig_to_base64(fig)
-
-
 # ---------------------------------------------------------------------------
 # Stats summary
 # ---------------------------------------------------------------------------
@@ -157,9 +268,13 @@ def summarize(events: list[dict], fills: pd.DataFrame, rejects: pd.DataFrame,
     duration = 0.0
     if events:
         duration = events[-1]["ts"] - events[0]["ts"]
+        
     final_positions = {}
+    final_pnl = 0.0
     if not snapshots.empty:
         final_positions = snapshots.iloc[-1].get("positions") or {}
+        final_pnl = snapshots.iloc[-1].get("calc_mtm", 0.0)
+        
     return {
         "events_total": len(events),
         "fills_total": len(fills),
@@ -167,6 +282,7 @@ def summarize(events: list[dict], fills: pd.DataFrame, rejects: pd.DataFrame,
         "snapshots_total": len(snapshots),
         "duration_sec": round(duration, 1),
         "final_positions": final_positions,
+        "final_pnl": round(final_pnl, 2)
     }
 
 
@@ -183,41 +299,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 1100px;
           margin: 30px auto; padding: 0 20px; color: #222; }}
   h1 {{ border-bottom: 2px solid #333; padding-bottom: 8px; }}
-  h2 {{ margin-top: 36px; color: #2c3e50; }}
-  .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
-            background: #f4f6f8; padding: 16px; border-radius: 8px; }}
+  h2 {{ margin-top: 36px; color: #2c3e50; font-size: 20px; border-left: 4px solid #3498db; padding-left: 10px; }}
+  .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+            background: #f4f6f8; padding: 16px; border-radius: 8px; margin-bottom: 20px; }}
   .stat {{ font-size: 14px; }}
-  .stat .label {{ color: #666; text-transform: uppercase; font-size: 11px; }}
-  .stat .value {{ font-size: 22px; font-weight: 600; color: #2c3e50; }}
-  .chart {{ margin: 18px 0; }}
-  img {{ max-width: 100%; border: 1px solid #ddd; border-radius: 4px; }}
-  pre {{ background: #f4f6f8; padding: 12px; border-radius: 4px; font-size: 12px; }}
+  .stat .label {{ color: #666; text-transform: uppercase; font-size: 11px; font-weight: bold; }}
+  .stat .value {{ font-size: 24px; font-weight: 600; color: #2c3e50; }}
+  .pnl-positive {{ color: #27ae60 !important; }}
+  .pnl-negative {{ color: #c0392b !important; }}
+  .chart {{ margin: 18px 0; background: #fff; padding: 10px; border: 1px solid #eaeaea; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }}
+  img {{ max-width: 100%; border-radius: 4px; display: block; }}
+  pre {{ background: #f4f6f8; padding: 12px; border-radius: 4px; font-size: 13px; color: #333; }}
 </style>
 </head>
 <body>
-<h1>Case 1 Round Report</h1>
-<p><strong>Log file:</strong> {filename}<br>
-<strong>Generated:</strong> {generated}</p>
+<h1>Case 1 Round Analysis</h1>
+<p style="color: #666;"><strong>Log file:</strong> {filename} | <strong>Generated:</strong> {generated}</p>
 
 <div class="stats">
   <div class="stat"><div class="label">Duration</div><div class="value">{duration_sec}s</div></div>
+  <div class="stat"><div class="label">Est. MtM PnL</div><div class="value {pnl_class}">${final_pnl}</div></div>
   <div class="stat"><div class="label">Fills</div><div class="value">{fills_total}</div></div>
   <div class="stat"><div class="label">Rejects</div><div class="value">{rejects_total}</div></div>
 </div>
 
-<h2>Final positions</h2>
-<pre>{final_positions}</pre>
+<h2>1. Performance & Exposure</h2>
+<div class="chart"><img src="data:image/png;base64,{chart_pnl}"></div>
+<div class="chart"><img src="data:image/png;base64,{chart_exposure}"></div>
 
-<h2>Positions over time</h2>
+<h2>2. Strategy Signals</h2>
+<div class="chart"><img src="data:image/png;base64,{chart_fv_and_rates}"></div>
+
+<h2>3. Position Management</h2>
 <div class="chart"><img src="data:image/png;base64,{chart_positions}"></div>
+<pre><strong>Final Positions:</strong> {final_positions}</pre>
 
-<h2>Mid prices with fills</h2>
+<h2>4. Market Context</h2>
 <div class="chart"><img src="data:image/png;base64,{chart_mids}"></div>
 
-<h2>Fill activity</h2>
-<div class="chart"><img src="data:image/png;base64,{chart_fill_rate}"></div>
-
-<h2>Rejected orders</h2>
+<h2>5. Errors & Rejections</h2>
 <div class="chart"><img src="data:image/png;base64,{chart_rejects}"></div>
 
 </body>
@@ -232,9 +352,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def main():
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else latest_log()
     print(f"Reading {path}")
+    
     events = load_log(path)
     if not events:
         sys.exit("Log file is empty.")
+
+    # Apply cash/PnL reconstruction logic
+    events = enrich_with_cash_and_pnl(events)
 
     df = pd.DataFrame(events)
     df["t_rel"] = to_relative_seconds(df["ts"])
@@ -243,8 +367,7 @@ def main():
     rejects   = df[df["kind"] == "reject"].copy()
     snapshots = df[df["kind"] == "snapshot"].copy()
 
-    # Best-effort: guess which symbol a fill belongs to from the position delta.
-    # (If you ever start logging the symbol explicitly in fills, drop this.)
+    # Best-effort symbol guessing for fills
     fills["symbol_guess"] = "?"
     prev_pos = {}
     guessed = []
@@ -261,16 +384,22 @@ def main():
 
     stats = summarize(events, fills, rejects, snapshots)
 
+    pnl_class = "pnl-positive" if float(stats["final_pnl"]) >= 0 else "pnl-negative"
+
     html = HTML_TEMPLATE.format(
         filename=path.name,
         generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         duration_sec=stats["duration_sec"],
+        final_pnl=stats["final_pnl"],
+        pnl_class=pnl_class,
         fills_total=stats["fills_total"],
         rejects_total=stats["rejects_total"],
         final_positions=json.dumps(stats["final_positions"], indent=2),
+        chart_pnl=chart_pnl(snapshots),
+        chart_exposure=chart_exposure(snapshots),
+        chart_fv_and_rates=chart_fv_and_rates(snapshots),
         chart_positions=chart_positions(snapshots),
         chart_mids=chart_mids(snapshots, fills),
-        chart_fill_rate=chart_fill_rate(snapshots, fills),
         chart_rejects=chart_rejects(rejects),
     )
 
@@ -278,9 +407,9 @@ def main():
     out.write_text(html)
     print(f"\nReport written to: {out}")
     print(f"  Duration:  {stats['duration_sec']}s")
+    print(f"  Est. PnL:  ${stats['final_pnl']}")
     print(f"  Fills:     {stats['fills_total']}")
     print(f"  Rejects:   {stats['rejects_total']}")
-    print(f"  Snapshots: {stats['snapshots_total']}")
     print(f"\nOpen with: open {out}")
 
 
