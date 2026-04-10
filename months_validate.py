@@ -178,18 +178,19 @@ def sliding_month_groups_shape(prices: np.ndarray) -> tuple[int, int, int]:
     return total_months, n_groups, tpm
 
 
-def evaluate_sliding_month_sharpes(
+def evaluate_sliding_month_summary(
     prices: np.ndarray,
     meta: PublicMeta,
     strategy_factory: Callable[[], StrategyBase],
     *,
     verbose: bool = False,
-) -> np.ndarray:
-    """Run sliding 24m train / 1m holdout; return annualized Sharpe per holdout month."""
+) -> tuple[np.ndarray, int]:
+    """Sliding 24m train / 1m holdout: Sharpes per month and count of blow-up holdouts."""
     train_m = TRAIN_MONTHS_PER_BLOCK
     total_months, n_groups, tpm = sliding_month_groups_shape(prices)
 
     sharpes: list[float] = []
+    blowups = 0
     for j in range(n_groups):
         train_start = j * tpm
         train_end = (j + train_m) * tpm
@@ -198,6 +199,7 @@ def evaluate_sliding_month_sharpes(
         hold_prices = prices[train_end:hold_end]
         strat = strategy_factory()
         result = run_backtest(train_prices, hold_prices, strat, meta)
+        blowups += int(result["blown_up"])
         sr = annualized_sharpe(result["daily_returns"])
         sharpes.append(sr)
         if verbose:
@@ -208,7 +210,19 @@ def evaluate_sliding_month_sharpes(
                 f"hold month {hold_m}, Sharpe = {sr:+.4f}{blown}"
             )
 
-    return np.asarray(sharpes, dtype=float)
+    return np.asarray(sharpes, dtype=float), blowups
+
+
+def evaluate_sliding_month_sharpes(
+    prices: np.ndarray,
+    meta: PublicMeta,
+    strategy_factory: Callable[[], StrategyBase],
+    *,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Run sliding 24m train / 1m holdout; return annualized Sharpe per holdout month."""
+    s, _ = evaluate_sliding_month_summary(prices, meta, strategy_factory, verbose=verbose)
+    return s
 
 
 def main() -> None:
