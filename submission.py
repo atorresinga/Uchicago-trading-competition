@@ -618,6 +618,81 @@ class MomentumTilt(StrategyBase):
         return self.current_weights
 
 
+class VolatilityFlatOverlay(StrategyBase):
+    """Wrap any ``StrategyBase``; flatten to **zero weights** when vol looks hot.
+
+    Each ``get_weights`` call (once per simulated day) updates the inner strategy
+    first, then measures **mean** per-asset annualized realized vol from recent
+    **tick** data (``_realized_vol_intraday``). If that mean exceeds
+    ``max(train_reference * spike_multiplier, floor_ann_vol)``, returns all-zero
+    weights (no exposure to the 25 names — effectively sideline / cash). Otherwise
+    returns the inner weights.
+
+    This keeps the inner model’s rebalance cadence and state intact while reacting
+    on a **short** vol lookback independent of the inner ``rebalance_freq``.
+    """
+
+    def __init__(
+        self,
+        inner: StrategyBase,
+        *,
+        vol_lookback_days: int = 5,
+        spike_multiplier: float = 1.35,
+        floor_ann_vol: float = 0.0,
+    ):
+        self._inner = inner
+        self.vol_lookback_days = int(vol_lookback_days)
+        self.spike_multiplier = float(spike_multiplier)
+        self.floor_ann_vol = float(floor_ann_vol)
+        self._ref_mean_ann_vol: float = 0.2
+
+    def fit(self, train_prices: np.ndarray, meta: PublicMeta, **kwargs) -> None:
+        self._inner.fit(train_prices, meta, **kwargs)
+        ann = _realized_vol_intraday(train_prices, self.vol_lookback_days)
+        self._ref_mean_ann_vol = float(np.mean(ann))
+
+    def _vol_threshold(self) -> float:
+        return max(
+            self._ref_mean_ann_vol * self.spike_multiplier,
+            self.floor_ann_vol,
+        )
+
+    def _is_high_vol(self, price_history: np.ndarray) -> bool:
+        ann = _realized_vol_intraday(price_history, self.vol_lookback_days)
+        cur = float(np.mean(ann))
+        return cur >= self._vol_threshold()
+
+    def get_weights(self, price_history: np.ndarray, meta: PublicMeta, day: int) -> np.ndarray:
+        w = self._inner.get_weights(price_history, meta, day)
+        if self._is_high_vol(price_history):
+            return np.zeros(N_ASSETS, dtype=float)
+        return w
+
+
+def create_momentum_vol_flat() -> VolatilityFlatOverlay:
+    """Momentum tilt + short-horizon vol spike → flat.
+
+    Defaults from Optuna (``optuna_tune.py --strategy momentum_vol_flat``,
+    35 trials, objective mean_sharpe - 0.02 * std_sharpe). Keep floats exact;
+    rounding noticeably changes sliding-month mean Sharpe.
+    """
+    inner = MomentumTilt(
+        momentum_lookback=70,
+        rebalance_freq=28,
+        spread_penalty=1.059123992729115,
+        borrow_penalty=1.8369393471694118,
+        zero_negative=True,
+        blend_rate=0.8323089855073922,
+        equal_weight_blend=0.09151429037573991,
+    )
+    return VolatilityFlatOverlay(
+        inner,
+        vol_lookback_days=7,
+        spike_multiplier=1.3491821645932678,
+        floor_ann_vol=0.05570811057399581,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Intraday Risk Parity Strategy
 # ---------------------------------------------------------------------------
@@ -893,6 +968,7 @@ STRATEGY_REGISTRY: dict[str, Callable[[], StrategyBase]] = {
     "vol_target_risk_parity": VolTargetRiskParity,
     "cost_aware_tilt": CostAwareTilt,
     "momentum_tilt": MomentumTilt,
+    "momentum_vol_flat": create_momentum_vol_flat,
     "intraday_risk_parity": create_default_intraday_risk_parity,
     "sector_aware_intraday_rp": create_sector_aware_intraday_risk_parity,
 }
